@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import * as TWEEN from '@tweenjs/tween.js';
 import { sound } from '../audio/SoundEngine';
 import { enhanceInterior, InteriorDetail } from './InteriorMaterials';
@@ -112,6 +113,7 @@ export class CarController {
 
   public async load(scene: THREE.Scene, onProgress?: (pct: number) => void): Promise<void> {
     const loader = new GLTFLoader();
+    loader.setMeshoptDecoder(MeshoptDecoder);
 
     return new Promise((resolve, reject) => {
       // Support both root and subpath deployments
@@ -351,6 +353,28 @@ export class CarController {
    * Split the combined wheel mesh into 4 independent spinning wheels with steering pivots
    */
   private setupWheels(model: THREE.Object3D) {
+    // Fast path: Check for reconstructed wheel nodes in GLB
+    const wheelFL = model.getObjectByName('Wheel_FL') as THREE.Mesh | undefined;
+    const wheelFR = model.getObjectByName('Wheel_FR') as THREE.Mesh | undefined;
+    const wheelRL = model.getObjectByName('Wheel_RL') as THREE.Mesh | undefined;
+    const wheelRR = model.getObjectByName('Wheel_RR') as THREE.Mesh | undefined;
+    const steerFL = model.getObjectByName('SteerPivot_FL') as THREE.Group | undefined;
+    const steerFR = model.getObjectByName('SteerPivot_FR') as THREE.Group | undefined;
+
+    if (wheelFL && wheelFR && wheelRL && wheelRR && steerFL && steerFR) {
+      this.wheelFL = wheelFL;
+      this.wheelFR = wheelFR;
+      this.wheelRL = wheelRL;
+      this.wheelRR = wheelRR;
+      this.steerPivotFL = steerFL;
+      this.steerPivotFR = steerFR;
+      this.wheelFL.castShadow = true;
+      this.wheelFR.castShadow = true;
+      this.wheelRL.castShadow = true;
+      this.wheelRR.castShadow = true;
+      return;
+    }
+
     let originalWheelMesh: THREE.Mesh | null = null;
 
     model.traverse((child) => {
@@ -497,6 +521,24 @@ export class CarController {
    * Setup 4 door pivot groups for natural door swing animations
    */
   private setupDoors(model: THREE.Object3D) {
+    // Fast path: Check for native door pivots in reconstructed model
+    const doorKeys: DoorId[] = ['FL', 'FR', 'RL', 'RR'];
+    let allPivotsFound = true;
+    for (const id of doorKeys) {
+      const pivot = model.getObjectByName(`Pivot_${id}`) as THREE.Group | undefined;
+      if (pivot) {
+        this.doorPivots[id] = pivot;
+        pivot.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) {
+            child.userData = { isDoorPart: true, doorId: id };
+          }
+        });
+      } else {
+        allPivotsFound = false;
+      }
+    }
+    if (allPivotsFound) return;
+
     // Model coordinates hinge pivot offsets:
     // DOOR1_8 (Left Front): Hinge near front edge Y=-98.3, X=-89.3, Z=-56.2
     // DOOR3_10 (Right Front): Hinge near front edge Y=-98.3, X=89.3, Z=-56.2
@@ -959,6 +1001,44 @@ export class CarController {
     this.screenTexture = new THREE.CanvasTexture(this.screenCanvas);
     this.screenTexture.colorSpace = THREE.SRGBColorSpace;
 
+    // Check for native screens in reconstructed model
+    const nativeScreen = this.carInnerGroup.getObjectByName('Screen_Center') as THREE.Mesh | undefined;
+    const nativeCluster = this.carInnerGroup.getObjectByName('Screen_Cluster') as THREE.Mesh | undefined;
+
+    // Self-lit display keeps UI contrast independent of the studio reflections.
+    const screenMat = new THREE.MeshBasicMaterial({
+      map: this.screenTexture,
+      toneMapped: false,
+      side: THREE.DoubleSide
+    });
+
+    // 2. Driver 7.1" Flip Digital Instrument Cluster (HUD)
+    this.hudCanvas = document.createElement('canvas');
+    this.hudCanvas.width = 512 * this.displayScale;
+    this.hudCanvas.height = 200 * this.displayScale;
+    this.hudCtx = this.hudCanvas.getContext('2d');
+    this.drawHudCanvas(0);
+
+    this.hudTexture = new THREE.CanvasTexture(this.hudCanvas);
+    this.hudTexture.colorSpace = THREE.SRGBColorSpace;
+
+    const hudMat = new THREE.MeshBasicMaterial({
+      map: this.hudTexture,
+      toneMapped: false,
+      side: THREE.DoubleSide
+    });
+
+    if (nativeScreen && nativeCluster) {
+      nativeScreen.material = screenMat;
+      nativeScreen.userData = { isCockpitScreen: true };
+      this.screenMesh = nativeScreen;
+
+      nativeCluster.material = hudMat;
+      this.hudMesh = nativeCluster;
+      this.carInnerGroup.add(this.cockpitScreenGroup);
+      return;
+    }
+
     // Bezel frame (16.1 inch, thickness 8mm)
     const bezelGeo = new THREE.BoxGeometry(0.354, 0.224, 0.008);
     const bezelMat = new THREE.MeshStandardMaterial({
@@ -968,13 +1048,7 @@ export class CarController {
     });
     const bezelMesh = new THREE.Mesh(bezelGeo, bezelMat);
 
-    // Self-lit display keeps UI contrast independent of the studio reflections.
     const screenGeo = this.cabinDisplays.screen ?? new THREE.PlaneGeometry(0.346, 0.216);
-    const screenMat = new THREE.MeshBasicMaterial({
-      map: this.screenTexture,
-      toneMapped: false,
-      side: THREE.DoubleSide
-    });
     this.screenMesh = new THREE.Mesh(screenGeo, screenMat);
     this.screenMesh.position.set(0, 0, this.cabinDisplays.screen ? 0 : 0.0045);
     this.screenMesh.userData = { isCockpitScreen: true };
@@ -1007,25 +1081,10 @@ export class CarController {
       this.cockpitScreenGroup.add(mainScreenAssembly);
     }
 
-    // 2. Driver 7.1" Flip Digital Instrument Cluster (HUD)
-    this.hudCanvas = document.createElement('canvas');
-    this.hudCanvas.width = 512 * this.displayScale;
-    this.hudCanvas.height = 200 * this.displayScale;
-    this.hudCtx = this.hudCanvas.getContext('2d');
-    this.drawHudCanvas(0);
-
-    this.hudTexture = new THREE.CanvasTexture(this.hudCanvas);
-    this.hudTexture.colorSpace = THREE.SRGBColorSpace;
-
     const hudBezelGeo = new THREE.BoxGeometry(0.186, 0.076, 0.006);
     const hudBezelMesh = new THREE.Mesh(hudBezelGeo, bezelMat);
 
     const hudScreenGeo = this.cabinDisplays.cluster ?? new THREE.PlaneGeometry(0.180, 0.070);
-    const hudMat = new THREE.MeshBasicMaterial({
-      map: this.hudTexture,
-      toneMapped: false,
-      side: THREE.DoubleSide
-    });
     this.hudMesh = new THREE.Mesh(hudScreenGeo, hudMat);
     this.hudMesh.position.set(0, 0, this.cabinDisplays.cluster ? 0 : 0.0035);
 

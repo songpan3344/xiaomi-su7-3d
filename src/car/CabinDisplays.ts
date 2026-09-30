@@ -7,6 +7,9 @@ export interface CabinDisplays {
 
 /** Reuse the two display surfaces in the bundled atlas instead of adding duplicate screens. */
 export function extractCabinDisplays(model: THREE.Object3D): CabinDisplays {
+  if (model.getObjectByName('Screen_Center')) {
+    return {};
+  }
   const result: CabinDisplays = {};
   const regions = [
     { key: 'screen' as const, bounds: [0.875, 0.930, 0.988, 0.998] },
