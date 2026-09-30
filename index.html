@@ -11,6 +11,17 @@
   <!-- 3D WebGL Canvas Container -->
   <div id="canvas-container"></div>
 
+  <div class="quality-controls glass-panel">
+    <label for="quality-select">画质</label>
+    <select id="quality-select" aria-label="画质设置">
+      <option value="auto">自动</option>
+      <option value="performance">流畅</option>
+      <option value="balanced">均衡</option>
+      <option value="high">高清</option>
+    </select>
+    <button id="btn-cockpit-view" type="button" aria-pressed="false">查看座舱</button>
+  </div>
+
   <!-- Loading Screen -->
   <div id="loading-screen" class="loading-screen">
     <div class="loader-car-pulse">

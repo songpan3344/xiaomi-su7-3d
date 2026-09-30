@@ -17,6 +17,8 @@ export class CameraManager {
   public controls: OrbitControls;
   public isAutoOrbit: boolean = false;
   public currentPreset: CameraPreset = 'hero';
+  public onPresetChange?: (preset: CameraPreset) => void;
+  private transitionTweens: TWEEN.Tween<THREE.Vector3>[] = [];
 
   private presets: Record<CameraPreset, PresetConfig> = {
     // Front 45° iconic hero shot
@@ -103,12 +105,15 @@ export class CameraManager {
    * Smooth cinematic glide transition to camera preset
    */
   public setPreset(preset: CameraPreset, durationMs: number = 1000) {
-    this.currentPreset = preset;
     const config = this.presets[preset];
     if (!config) return;
+    this.currentPreset = preset;
+    this.transitionTweens.forEach(tween => { tween.stop(); TWEEN.remove(tween); });
+    this.camera.near = preset === 'cockpit' ? 0.025 : 0.1;
+    this.camera.updateProjectionMatrix();
+    this.onPresetChange?.(preset);
 
     // Pause auto orbit during transition
-    const wasAutoOrbit = this.controls.autoRotate;
     this.controls.autoRotate = false;
 
     // Update constraints
@@ -116,20 +121,20 @@ export class CameraManager {
     if (config.maxDist !== undefined) this.controls.maxDistance = config.maxDist;
     if (config.maxPolar !== undefined) this.controls.maxPolarAngle = config.maxPolar;
 
-    new TWEEN.Tween(this.camera.position, true)
+    const positionTween = new TWEEN.Tween(this.camera.position, true)
       .to({ x: config.pos.x, y: config.pos.y, z: config.pos.z }, durationMs)
       .easing(TWEEN.Easing.Cubic.InOut)
       .start();
 
-    new TWEEN.Tween(this.controls.target, true)
+    const targetTween = new TWEEN.Tween(this.controls.target, true)
       .to({ x: config.target.x, y: config.target.y, z: config.target.z }, durationMs)
       .easing(TWEEN.Easing.Cubic.InOut)
       .onComplete(() => {
-        if (wasAutoOrbit && preset !== 'cockpit' && preset !== 'drive') {
-          this.controls.autoRotate = true;
-        }
+        this.controls.autoRotate = this.isAutoOrbit && preset !== 'cockpit' && preset !== 'drive';
+        this.transitionTweens = [];
       })
       .start();
+    this.transitionTweens = [positionTween, targetTween];
   }
 
   /**
