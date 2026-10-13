@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import * as TWEEN from '@tweenjs/tween.js';
 import { sound } from '../audio/SoundEngine';
+import { enhanceInterior, InteriorDetail } from './InteriorMaterials';
+import { extractCabinDisplays, CabinDisplays } from './CabinDisplays';
 
 export interface CarColorPreset {
   id: string;
@@ -34,6 +36,9 @@ export class CarController {
   private frontLightMat: THREE.MeshStandardMaterial | null = null;
   private backLightMat: THREE.MeshStandardMaterial | null = null;
   private interiorLight: THREE.PointLight | null = null;
+  private cabinViewLight: THREE.PointLight | null = null;
+  private interiorDetails: InteriorDetail[] = [];
+  private interiorDetailEnabled = true;
   private headLightSpots: THREE.SpotLight[] = [];
 
   // Wheel components
@@ -86,6 +91,11 @@ export class CarController {
   private hudTexture: THREE.CanvasTexture | null = null;
   private hudMesh: THREE.Mesh | null = null;
   private screenClockSec: number = 0;
+  private displayScale: 1 | 2 = 1;
+  private lastHudSpeed = -1;
+  private lastHudMoving = false;
+  private hudSpeedKmH = 0;
+  private cabinDisplays: CabinDisplays = {};
 
   // Ground plane & bounds
   public readonly carLength = 4.997; // meters
@@ -130,6 +140,7 @@ export class CarController {
           rawModel.position.set(0, 0.0297 * scale, 0);
 
           this.carInnerGroup.add(rawModel);
+          this.cabinDisplays = extractCabinDisplays(rawModel);
 
           // 2. Setup materials, wheels, doors, lights
           this.setupMaterials(rawModel);
@@ -165,6 +176,8 @@ export class CarController {
    */
   private setupMaterials(model: THREE.Object3D) {
     this.paintMaterials = [];
+    this.interiorDetails = [];
+    const interiorCache = new Map<THREE.Material, InteriorDetail>();
 
     model.traverse((child) => {
       if ((child as THREE.Mesh).isMesh) {
@@ -180,6 +193,9 @@ export class CarController {
             roughness: 0.16,
             clearcoat: 1.0,
             clearcoatRoughness: 0.06,
+            aoMap: (mat as THREE.MeshStandardMaterial).aoMap,
+            aoMapIntensity: (mat as THREE.MeshStandardMaterial).aoMapIntensity,
+            roughnessMap: (mat as THREE.MeshStandardMaterial).roughnessMap,
             envMapIntensity: 1.4,
             reflectivity: 0.95
           });
@@ -192,16 +208,18 @@ export class CarController {
         // Tinted panoramic glass canopy & windows
         else if (mat.name === 'Car_window') {
           mesh.material = new THREE.MeshPhysicalMaterial({
-            color: new THREE.Color(0x0a1018),
-            metalness: 0.15,
-            roughness: 0.04,
+            color: new THREE.Color(0x8296a5),
+            metalness: 0,
+            roughness: 0.06,
             transparent: true,
-            opacity: 0.45,
+            opacity: 0.28,
+            side: mat.side,
+            depthWrite: false,
             clearcoat: 1.0,
             clearcoatRoughness: 0.03,
-            envMapIntensity: 2.0
+            envMapIntensity: 0.8
           });
-          mesh.castShadow = true;
+          mesh.castShadow = false;
         }
 
         // Glossy black aerodynamic trim, diffuser & skirts
@@ -271,12 +289,62 @@ export class CarController {
 
         // Interior materials
         else if (mat.name.startsWith('interior')) {
-          const intMat = mesh.material as THREE.MeshStandardMaterial;
-          intMat.roughness = 0.7;
-          intMat.metalness = 0.1;
+          let detail = interiorCache.get(mat);
+          if (!detail) {
+            detail = enhanceInterior(mat as THREE.MeshStandardMaterial) ?? undefined;
+            if (detail) {
+              interiorCache.set(mat, detail);
+              this.interiorDetails.push(detail);
+            }
+          }
+          if (detail) mesh.material = detail.material;
+          mesh.receiveShadow = true;
         }
       }
     });
+    this.applyInteriorDetail();
+  }
+
+  private applyInteriorDetail() {
+    for (const detail of this.interiorDetails) {
+      const material = detail.material;
+      const normal = this.interiorDetailEnabled ? detail.normal : null;
+      if (material.normalMap === normal && material.roughnessMap === (this.interiorDetailEnabled ? detail.surface : null)) continue;
+      material.normalMap = normal;
+      material.roughnessMap = this.interiorDetailEnabled ? detail.surface : null;
+      material.metalnessMap = this.interiorDetailEnabled ? detail.surface : null;
+      material.roughness = this.interiorDetailEnabled ? 1 : 0.72;
+      material.metalness = this.interiorDetailEnabled ? 1 : 0;
+      material.needsUpdate = true;
+    }
+  }
+
+  public setVisualQuality(interiorDetail: boolean, displayScale: 1 | 2) {
+    this.interiorDetailEnabled = interiorDetail;
+    this.applyInteriorDetail();
+    if (this.displayScale === displayScale) return;
+    this.displayScale = displayScale;
+    if (!this.screenCanvas || !this.hudCanvas || !this.screenMesh || !this.hudMesh) return;
+    this.screenCanvas.width = 1024 * displayScale;
+    this.screenCanvas.height = 640 * displayScale;
+    this.hudCanvas.width = 512 * displayScale;
+    this.hudCanvas.height = 200 * displayScale;
+    this.drawHyperOsCanvas();
+    this.drawHudCanvas(this.hudSpeedKmH);
+    // Texture dimensions are immutable after upload: replace and dispose on quality changes.
+    this.screenTexture?.dispose();
+    this.hudTexture?.dispose();
+    this.screenTexture = new THREE.CanvasTexture(this.screenCanvas);
+    this.hudTexture = new THREE.CanvasTexture(this.hudCanvas);
+    this.screenTexture.colorSpace = this.hudTexture.colorSpace = THREE.SRGBColorSpace;
+    const screenMaterial = this.screenMesh.material as THREE.MeshBasicMaterial;
+    const hudMaterial = this.hudMesh.material as THREE.MeshBasicMaterial;
+    screenMaterial.map = this.screenTexture;
+    hudMaterial.map = this.hudTexture;
+  }
+
+  public setCockpitView(active: boolean) {
+    if (this.cabinViewLight) this.cabinViewLight.intensity = active ? 0.3 : 0;
   }
 
   /**
@@ -480,6 +548,11 @@ export class CarController {
     this.interiorLight = new THREE.PointLight(0x00e5ff, 0, 3.0);
     this.interiorLight.position.set(0, 0.95, -0.15);
     this.rootGroup.add(this.interiorLight);
+
+    // Neutral inspection light makes the dashboard readable without changing the ambient color.
+    this.cabinViewLight = new THREE.PointLight(0xfff3df, 0, 2.0, 2);
+    this.cabinViewLight.position.set(0, 1.23, 0.08);
+    this.rootGroup.add(this.cabinViewLight);
 
     // Front high beam projection spots
     const leftSpot = new THREE.SpotLight(0xf0faff, 0, 30, Math.PI / 6, 0.4, 1.2);
@@ -878,8 +951,8 @@ export class CarController {
 
     // 1. Central 16.1" Touchscreen (16:10 aspect ratio)
     this.screenCanvas = document.createElement('canvas');
-    this.screenCanvas.width = 1024;
-    this.screenCanvas.height = 640;
+    this.screenCanvas.width = 1024 * this.displayScale;
+    this.screenCanvas.height = 640 * this.displayScale;
     this.screenCtx = this.screenCanvas.getContext('2d');
     this.drawHyperOsCanvas();
 
@@ -895,18 +968,15 @@ export class CarController {
     });
     const bezelMesh = new THREE.Mesh(bezelGeo, bezelMat);
 
-    // Screen surface with emissive display
-    const screenGeo = new THREE.PlaneGeometry(0.346, 0.216);
-    const screenMat = new THREE.MeshStandardMaterial({
+    // Self-lit display keeps UI contrast independent of the studio reflections.
+    const screenGeo = this.cabinDisplays.screen ?? new THREE.PlaneGeometry(0.346, 0.216);
+    const screenMat = new THREE.MeshBasicMaterial({
       map: this.screenTexture,
-      roughness: 0.15,
-      metalness: 0.1,
-      emissive: new THREE.Color(0xffffff),
-      emissiveMap: this.screenTexture,
-      emissiveIntensity: 0.85
+      toneMapped: false,
+      side: THREE.DoubleSide
     });
     this.screenMesh = new THREE.Mesh(screenGeo, screenMat);
-    this.screenMesh.position.set(0, 0, 0.0045);
+    this.screenMesh.position.set(0, 0, this.cabinDisplays.screen ? 0 : 0.0045);
     this.screenMesh.userData = { isCockpitScreen: true };
 
     // Metal pedestal stand
@@ -928,12 +998,19 @@ export class CarController {
     // Position in cabin: Centered at X = 0, Y = 0.865, Z = -0.385, tilted back by ~9 degrees
     mainScreenAssembly.position.set(0, 0.865, -0.385);
     mainScreenAssembly.rotation.x = -0.16;
-    this.cockpitScreenGroup.add(mainScreenAssembly);
+    if (this.cabinDisplays.screen) {
+      this.cockpitScreenGroup.add(this.screenMesh);
+      bezelGeo.dispose();
+      standGeo.dispose();
+      standMat.dispose();
+    } else {
+      this.cockpitScreenGroup.add(mainScreenAssembly);
+    }
 
     // 2. Driver 7.1" Flip Digital Instrument Cluster (HUD)
     this.hudCanvas = document.createElement('canvas');
-    this.hudCanvas.width = 512;
-    this.hudCanvas.height = 200;
+    this.hudCanvas.width = 512 * this.displayScale;
+    this.hudCanvas.height = 200 * this.displayScale;
     this.hudCtx = this.hudCanvas.getContext('2d');
     this.drawHudCanvas(0);
 
@@ -943,17 +1020,14 @@ export class CarController {
     const hudBezelGeo = new THREE.BoxGeometry(0.186, 0.076, 0.006);
     const hudBezelMesh = new THREE.Mesh(hudBezelGeo, bezelMat);
 
-    const hudScreenGeo = new THREE.PlaneGeometry(0.180, 0.070);
-    const hudMat = new THREE.MeshStandardMaterial({
+    const hudScreenGeo = this.cabinDisplays.cluster ?? new THREE.PlaneGeometry(0.180, 0.070);
+    const hudMat = new THREE.MeshBasicMaterial({
       map: this.hudTexture,
-      roughness: 0.2,
-      metalness: 0.1,
-      emissive: new THREE.Color(0xffffff),
-      emissiveMap: this.hudTexture,
-      emissiveIntensity: 0.9
+      toneMapped: false,
+      side: THREE.DoubleSide
     });
     this.hudMesh = new THREE.Mesh(hudScreenGeo, hudMat);
-    this.hudMesh.position.set(0, 0, 0.0035);
+    this.hudMesh.position.set(0, 0, this.cabinDisplays.cluster ? 0 : 0.0035);
 
     const hudAssembly = new THREE.Group();
     hudAssembly.add(hudBezelMesh);
@@ -961,7 +1035,13 @@ export class CarController {
     // Position directly in front of steering wheel: X = -0.40, Y = 0.860, Z = -0.62
     hudAssembly.position.set(-0.40, 0.860, -0.62);
     hudAssembly.rotation.x = -0.18;
-    this.cockpitScreenGroup.add(hudAssembly);
+    if (this.cabinDisplays.cluster) {
+      this.cockpitScreenGroup.add(this.hudMesh);
+      hudBezelGeo.dispose();
+      if (this.cabinDisplays.screen) bezelMat.dispose();
+    } else {
+      this.cockpitScreenGroup.add(hudAssembly);
+    }
 
     this.carInnerGroup.add(this.cockpitScreenGroup);
   }
@@ -969,8 +1049,9 @@ export class CarController {
   private drawHyperOsCanvas() {
     if (!this.screenCtx || !this.screenCanvas) return;
     const ctx = this.screenCtx;
-    const w = this.screenCanvas.width;
-    const h = this.screenCanvas.height;
+    ctx.setTransform(this.displayScale, 0, 0, this.displayScale, 0, 0);
+    const w = 1024;
+    const h = 640;
 
     const roundRect = (x: number, y: number, rw: number, rh: number, r: number) => {
       if (ctx.roundRect) {
@@ -1297,8 +1378,9 @@ export class CarController {
   private drawHudCanvas(speedKmH: number = 0) {
     if (!this.hudCtx || !this.hudCanvas) return;
     const ctx = this.hudCtx;
-    const w = this.hudCanvas.width;
-    const h = this.hudCanvas.height;
+    ctx.setTransform(this.displayScale, 0, 0, this.displayScale, 0, 0);
+    const w = 512;
+    const h = 200;
 
     ctx.fillStyle = '#06080d';
     ctx.fillRect(0, 0, w, h);
@@ -1359,6 +1441,12 @@ export class CarController {
   }
 
   public updateHud(speedKmH: number) {
+    this.hudSpeedKmH = speedKmH;
+    const speed = Math.round(speedKmH);
+    const moving = speedKmH > 0;
+    if (speed === this.lastHudSpeed && moving === this.lastHudMoving) return;
+    this.lastHudSpeed = speed;
+    this.lastHudMoving = moving;
     this.drawHudCanvas(speedKmH);
     if (this.hudTexture) {
       this.hudTexture.needsUpdate = true;

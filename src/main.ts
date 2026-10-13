@@ -5,6 +5,7 @@ import { EnvironmentManager } from './environment/EnvironmentManager';
 import { CameraManager } from './camera/CameraManager';
 import { UIManager } from './ui/UIManager';
 import { sound } from './audio/SoundEngine';
+import { QualityManager, QualityMode } from './rendering/QualityManager';
 
 async function bootstrap() {
   const container = document.getElementById('canvas-container');
@@ -16,9 +17,7 @@ async function bootstrap() {
     powerPreference: 'high-performance',
     preserveDrawingBuffer: true // Required for poster snapshot export
   });
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  const isLowPower = /arm|aarch64|mobile/i.test(navigator.userAgent);
-  renderer.setPixelRatio(isLowPower ? 1.0 : Math.min(window.devicePixelRatio, 1.5));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
   renderer.shadowMap.enabled = true;
@@ -32,12 +31,32 @@ async function bootstrap() {
   const env = new EnvironmentManager(scene, renderer);
   const cameraManager = new CameraManager(container);
   const car = new CarController();
+  const quality = new QualityManager(renderer, scene);
+  quality.onChange(profile => car.setVisualQuality(profile.interiorDetail, profile.displayScale));
+  const qualitySelect = document.getElementById('quality-select') as HTMLSelectElement | null;
+  if (qualitySelect) {
+    qualitySelect.value = quality.mode;
+    qualitySelect.addEventListener('change', () => quality.setMode(qualitySelect.value as QualityMode));
+  }
+  const cockpitButton = document.getElementById('btn-cockpit-view');
+  cockpitButton?.addEventListener('click', () => cameraManager.setPreset(cameraManager.currentPreset === 'cockpit' ? 'hero' : 'cockpit'));
+  cameraManager.onPresetChange = preset => {
+    document.body.classList.toggle('driving-mode', env.isDrivingMode);
+    document.body.classList.toggle('cockpit-view', preset === 'cockpit');
+    car.setCockpitView(preset === 'cockpit');
+    if (cockpitButton) {
+      cockpitButton.textContent = preset === 'cockpit' ? '返回外观' : '查看座舱';
+      cockpitButton.setAttribute('aria-pressed', String(preset === 'cockpit'));
+    }
+    document.querySelectorAll<HTMLElement>('.cam-btn').forEach(button => button.classList.toggle('active', button.dataset.cam === preset));
+  };
 
   // Expose for inspection and verification
   (window as any).__car = car;
   (window as any).__scene = scene;
   (window as any).__camera = cameraManager;
   (window as any).__env = env;
+  (window as any).__quality = quality;
 
   // 4. Loading Progress Hooks
   const loadingScreen = document.getElementById('loading-screen');
@@ -48,14 +67,15 @@ async function bootstrap() {
     if (loadingProgress) loadingProgress.style.width = `${pct}%`;
     if (loadingStatus) {
       if (pct < 35) loadingStatus.textContent = `正在加载 SU7 3D 几何网格... ${pct}%`;
-      else if (pct < 75) loadingStatus.textContent = `正在生成 4K 金属车漆与座舱材质... ${pct}%`;
-      else if (pct < 99) loadingStatus.textContent = `正在校验小米澎湃智能座舱与激光雷达... ${pct}%`;
+      else if (pct < 75) loadingStatus.textContent = `正在加载车漆与座舱贴图... ${pct}%`;
+      else if (pct < 99) loadingStatus.textContent = `正在准备座舱材质与交互部件... ${pct}%`;
       else loadingStatus.textContent = `准备就绪，欢迎进入小米 SU7 展厅！`;
     }
   };
 
   try {
     await car.load(scene, (pct) => updateProgress(pct));
+    quality.apply();
     updateProgress(100);
 
     setTimeout(() => {
@@ -83,6 +103,7 @@ async function bootstrap() {
   });
 
   window.addEventListener('click', (e) => {
+    if (e.target !== renderer.domElement) return;
     // Distinguish click from camera drag: only trigger if mouse was down < 250ms
     if (performance.now() - mouseDownTime > 250) return;
 
@@ -98,6 +119,10 @@ async function bootstrap() {
 
   // Cursor change on hover over clickable doors
   window.addEventListener('mousemove', (e) => {
+    if (e.target !== renderer.domElement) {
+      container.style.cursor = 'default';
+      return;
+    }
     mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
 
@@ -112,7 +137,7 @@ async function bootstrap() {
     const width = window.innerWidth;
     const height = window.innerHeight;
     cameraManager.onResize(width, height);
-    renderer.setSize(width, height);
+    quality.resize();
   });
 
   // 8. Main Render Loop
@@ -123,7 +148,7 @@ async function bootstrap() {
 
     const dt = clock.getDelta();
 
-    TWEEN.update();
+    TWEEN.update(undefined, false);
     cameraManager.update();
     env.update(dt);
     car.update(dt);
